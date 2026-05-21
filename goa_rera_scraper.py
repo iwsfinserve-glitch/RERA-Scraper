@@ -14,6 +14,7 @@ from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.support.expected_conditions import alert_is_present
 
 from bs4 import BeautifulSoup, NavigableString
 import pandas as pd
@@ -73,89 +74,224 @@ class RERADownloader:
         return driver
 
     # ── CAPTCHA ──────────────────────────
-    def _solve_captcha(self):
+    def _solve_captcha(self, debug=False):
+        from PIL import ImageFilter, ImageOps
+
         captcha_el = self.driver.find_element(By.ID, "captcha_id")
         png_bytes = captcha_el.screenshot_as_png
 
-        img = Image.open(io.BytesIO(png_bytes)).convert("L")
-        img = ImageEnhance.Brightness(img).enhance(5)
-        img = ImageEnhance.Contrast(img).enhance(5)
-        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-        img = img.point(lambda x: 0 if x < 140 else 255)
+        img_orig = Image.open(io.BytesIO(png_bytes))
 
+        if debug:
+            os.makedirs("./captcha_debug", exist_ok=True)
+            ts = int(time.time())
+            img_orig.save(f"./captcha_debug/raw_{ts}.png")
+
+        # ── OPTIMAL PIPELINE (tested against real CAPTCHA image) ──────────────
+        # This CAPTCHA: light gray bg (~213), dark italic text (~39)
+        # Key insight: PSM 7 (single line) beats PSM 8 (single word)
+        # for this handwritten/italic font style.
+        # Minimal processing is better — over-processing destroys thin strokes.
+
+        img = img_orig.convert("L")                                    # grayscale
+        img = ImageEnhance.Contrast(img).enhance(1.8)                  # gentle boost only
+        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)  # 4x upscale
+        img = img.point(lambda x: 0 if x < 180 else 255)              # binarize at 180
+
+        if debug:
+            img.save(f"./captcha_debug/processed_{ts}.png")
+
+        whitelist = (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        )
+
+        # PRIMARY: PSM 7 — single text line mode (most accurate for this font)
         text = pytesseract.image_to_string(
             img,
-            config=(
-                "--psm 8 --oem 3 "
-                "-c tessedit_char_whitelist="
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-            ),
+            config=f"--psm 7 --oem 1 -c tessedit_char_whitelist={whitelist}",
+        )
+        result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+        logger.info(f"OCR result: '{result}' ({len(result)} chars)")
+
+        # FALLBACK: if PSM 7 gives wrong length, try gentle-contrast variant
+        if len(result) != 6:
+            img2 = img_orig.convert("L")
+            img2 = img2.resize((img2.width * 4, img2.height * 4), Image.LANCZOS)
+            text2 = pytesseract.image_to_string(
+                img2,
+                config=f"--psm 7 --oem 1 -c tessedit_char_whitelist={whitelist}",
+            )
+            result2 = re.sub(r"[^A-Za-z0-9]", "", text2).strip()
+            logger.info(f"OCR fallback: '{result2}' ({len(result2)} chars)")
+            if len(result2) == 6:
+                return result2
+
+        return result
+        from PIL import ImageFilter
+        
+        captcha_el = self.driver.find_element(By.ID, "captcha_id")
+        png_bytes = captcha_el.screenshot_as_png
+
+        os.makedirs("./captcha_debug", exist_ok=True)
+        ts = int(time.time())
+        
+        img_orig = Image.open(io.BytesIO(png_bytes))
+        
+        if debug:
+            img_orig.save(f"./captcha_debug/raw_{ts}.png")
+
+        # Strategy 1: Standard grayscale + aggressive contrast
+        img = img_orig.convert("L")
+        img = ImageEnhance.Contrast(img).enhance(3.0)
+        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
+        img = img.point(lambda x: 0 if x < 150 else 255)
+        img = img.filter(ImageFilter.SHARPEN)
+        
+        if debug:
+            img.save(f"./captcha_debug/processed_{ts}.png")
+
+        psm_modes = ["--psm 8", "--psm 7", "--psm 13"]
+        whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        
+        for psm in psm_modes:
+            text = pytesseract.image_to_string(
+                img,
+                config=f"{psm} --oem 3 -c tessedit_char_whitelist={whitelist}",
+            )
+            result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+            logger.info(f"OCR ({psm}): '{result}' ({len(result)} chars)")
+            if len(result) == 6:
+                return result
+
+        # Strategy 2: Try on RGB channels separately (catches colored-text CAPTCHAs)
+        for channel_idx, channel_name in enumerate(["R", "G", "B"]):
+            ch = img_orig.split()[channel_idx]
+            ch = ImageEnhance.Contrast(ch).enhance(3.0)
+            ch = ch.resize((ch.width * 4, ch.height * 4), Image.LANCZOS)
+            ch = ch.point(lambda x: 0 if x < 150 else 255)
+            
+            if debug:
+                ch.save(f"./captcha_debug/channel_{channel_name}_{ts}.png")
+            
+            text = pytesseract.image_to_string(
+                ch,
+                config=f"--psm 8 --oem 3 -c tessedit_char_whitelist={whitelist}",
+            )
+            result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+            logger.info(f"OCR (channel {channel_name}): '{result}' ({len(result)} chars)")
+            if len(result) == 6:
+                return result
+
+        # Return best guess even if not 6 chars (let retry loop handle it)
+        text = pytesseract.image_to_string(
+            img, config=f"--psm 8 --oem 3 -c tessedit_char_whitelist={whitelist}"
         )
         return re.sub(r"[^A-Za-z0-9]", "", text).strip()
 
-    def search_with_captcha_retry(self, max_attempts=5):
-        from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException
+    def search_with_captcha_retry(self, max_attempts=10):  # bumped to 10
         for attempt in range(1, max_attempts + 1):
+            solved = ""
             try:
-                # Clear any unexpected alert that might be active
+                # Dismiss any lingering alert first
                 try:
-                    alert = self.driver.switch_to.alert
-                    logger.warning(f"Pre-attempt alert accepted: {alert.text}")
-                    alert.accept()
-                except NoAlertPresentException:
+                    self.driver.switch_to.alert.accept()
+                    logger.debug("Dismissed stale alert")
+                except Exception:
                     pass
 
                 solved = self._solve_captcha()
-                
-                # Check captcha length before submitting to avoid client-side alert
+
                 if len(solved) != 6:
-                    logger.warning(f"Attempt {attempt}: OCR read '{solved}' is not 6 characters. Refreshing CAPTCHA.")
-                    if attempt < max_attempts:
-                        try:
-                            self.driver.find_element(By.ID, "captcha_id").click()
-                            time.sleep(1.5)
-                        except Exception:
-                            pass
+                    logger.warning(
+                        f"Attempt {attempt}: OCR gave {len(solved)} chars '{solved}' — refreshing"
+                    )
+                    self._refresh_captcha()
                     continue
 
                 captcha_input = self.driver.find_element(By.ID, "captcha")
                 captcha_input.clear()
                 captcha_input.send_keys(solved)
+                
+                logger.info(f"Attempt {attempt}: submitting '{solved}'")
                 self.driver.find_element(By.NAME, "btn1").click()
 
-                WebDriverWait(self.driver, 6).until(
-                    lambda d: d.find_elements(By.CSS_SELECTOR, "div.search_result_list")
-                    or d.find_elements(
-                        By.XPATH, "//*[contains(text(),'Showing record')]"
-                    )
-                )
-                logger.info(
-                    f"CAPTCHA solved on attempt {attempt} (OCR read: '{solved}')"
-                )
-                return
-            except UnexpectedAlertPresentException as e:
-                logger.warning(f"Attempt {attempt} failed due to unexpected alert (OCR read: '{solved}'): {e.alert_text}")
+                # Check for alert (wrong captcha)
                 try:
-                    alert = self.driver.switch_to.alert
-                    alert.accept()
-                except NoAlertPresentException:
-                    pass
-                if attempt < max_attempts:
-                    try:
-                        self.driver.find_element(By.ID, "captcha_id").click()
-                        time.sleep(1.5)
-                    except Exception:
-                        pass
-            except TimeoutException:
-                logger.warning(f"Attempt {attempt} failed (OCR read: '{solved}')")
-                if attempt < max_attempts:
-                    try:
-                        self.driver.find_element(By.ID, "captcha_id").click()
-                        time.sleep(1.5)
-                    except Exception:
-                        pass
+                    WebDriverWait(self.driver, 2).until(EC.alert_is_present())
+                    alert_text = self.driver.switch_to.alert.text
+                    self.driver.switch_to.alert.accept()
+                    logger.warning(f"Attempt {attempt}: portal rejected '{solved}' — alert: '{alert_text}'")
+                    self._refresh_captcha()
+                    continue
+                except TimeoutException:
+                    pass  # No alert = captcha accepted, check for results
 
-        raise CaptchaFailureError("Failed after 5 attempts")
+                # Wait for results
+                WebDriverWait(self.driver, 10).until(
+                    lambda d: d.find_elements(By.CSS_SELECTOR, "div.search_result_list")
+                    or d.find_elements(By.XPATH, "//*[contains(text(),'Showing record')]")
+                )
+                logger.info(f"SUCCESS on attempt {attempt} with '{solved}'")
+                return
+
+            except TimeoutException:
+                logger.warning(f"Attempt {attempt}: results didn't load for '{solved}'")
+                self._refresh_captcha()
+
+        raise CaptchaFailureError(f"Failed after {max_attempts} attempts")
+
+
+    def _refresh_captcha(self):
+        """Reliably get a fresh CAPTCHA image."""
+        refreshed = False
+        
+        # Try clicking a refresh/reload icon near the captcha
+        refresh_xpaths = [
+            "//img[@id='captcha_id']/following-sibling::img",
+            "//img[@id='captcha_id']/following-sibling::a",
+            "//*[contains(@onclick,'captcha') or contains(@onclick,'refresh')]",
+            "//i[contains(@class,'refresh') or contains(@class,'reload')]",
+            "//span[contains(@class,'refresh')]",
+        ]
+        for xpath in refresh_xpaths:
+            try:
+                el = self.driver.find_element(By.XPATH, xpath)
+                el.click()
+                time.sleep(1.5)
+                refreshed = True
+                logger.debug(f"Refreshed CAPTCHA via: {xpath}")
+                break
+            except Exception:
+                continue
+
+        if not refreshed:
+            # Nuclear option: reload page and re-select Project
+            logger.info("No refresh button found — reloading page")
+            self.driver.refresh()
+            time.sleep(2)
+            try:
+                self.wait.until(EC.presence_of_element_located((By.ID, "Regtype")))
+                Select(self.driver.find_element(By.ID, "Regtype")).select_by_value("Project")
+                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"Re-select after refresh failed: {e}")
+            """Click the CAPTCHA refresh icon to get a new image."""
+            try:
+                # Most RERA portals have a refresh icon next to the captcha
+                refresh = self.driver.find_element(
+                    By.XPATH,
+                    "//*[@id='captcha_id']/following-sibling::*[1] | "
+                    "//img[contains(@src,'refresh')] | "
+                    "//*[contains(@onclick,'refresh') or contains(@onclick,'captcha')]"
+                )
+                refresh.click()
+            except NoSuchElementException:
+                # Fallback: reload the page and re-submit the form
+                logger.info("No refresh button found — reloading page")
+                self.driver.refresh()
+                self.wait.until(EC.presence_of_element_located((By.ID, "Regtype")))
+                Select(self.driver.find_element(By.ID, "Regtype")).select_by_value("Project")
+            time.sleep(1.5)
 
     # ── Search Form ──────────────────────
     def submit_search_form(self):
@@ -258,7 +394,7 @@ class RERADownloader:
             logger.info(f"[{reg_no}] Detail page cached")
 
             soup = BeautifulSoup(self.driver.page_source, "html.parser")
-            deed_link = soup.find("a", string=re.compile(r"Land Deed|Agreement", re.I))
+            deed_link = soup.find("a", string=re.compile(r"Land Deed/Agreement", re.I))
 
             if deed_link and deed_link.get("href"):
                 deed_url = urljoin(BASE_URL, deed_link["href"])

@@ -6,6 +6,7 @@ import logging
 import math
 from glob import glob
 from urllib.parse import urljoin
+import random
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -50,10 +51,10 @@ class ParserError(Exception):
 class RERADownloader:
     """Selenium-only downloader. Zero parsing logic."""
 
-    def __init__(self):
+    def __init__(self, headless=True):
         os.makedirs(CACHE_DIR, exist_ok=True)
         os.makedirs(DEEDS_DIR, exist_ok=True)
-        self.driver = self._build_driver(headless=True)
+        self.driver = self._build_driver(headless=headless)
         self.wait = WebDriverWait(self.driver, 15)
 
     def _build_driver(self, headless=True):
@@ -70,11 +71,12 @@ class RERADownloader:
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
         driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(30)
         driver.implicitly_wait(5)
         return driver
 
     # ── CAPTCHA ──────────────────────────
-    def _solve_captcha(self, debug=False):
+    def _solve_captcha(self, debug=True):
         from PIL import ImageFilter, ImageOps
 
         captcha_el = self.driver.find_element(By.ID, "captcha_id")
@@ -87,16 +89,10 @@ class RERADownloader:
             ts = int(time.time())
             img_orig.save(f"./captcha_debug/raw_{ts}.png")
 
-        # ── OPTIMAL PIPELINE (tested against real CAPTCHA image) ──────────────
-        # This CAPTCHA: light gray bg (~213), dark italic text (~39)
-        # Key insight: PSM 7 (single line) beats PSM 8 (single word)
-        # for this handwritten/italic font style.
-        # Minimal processing is better — over-processing destroys thin strokes.
-
-        img = img_orig.convert("L")                                    # grayscale
-        img = ImageEnhance.Contrast(img).enhance(1.8)                  # gentle boost only
-        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)  # 4x upscale
-        img = img.point(lambda x: 0 if x < 180 else 255)              # binarize at 180
+        img = img_orig.convert("L")                                    
+        img = ImageEnhance.Contrast(img).enhance(1.8)                  
+        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS) 
+        img = img.point(lambda x: 0 if x < 180 else 255)              
 
         if debug:
             img.save(f"./captcha_debug/processed_{ts}.png")
@@ -242,66 +238,52 @@ class RERADownloader:
 
 
     def _refresh_captcha(self):
-        """Reliably get a fresh CAPTCHA image."""
-        refreshed = False
-        
-        # Try clicking a refresh/reload icon near the captcha
-        refresh_xpaths = [
-            "//img[@id='captcha_id']/following-sibling::img",
-            "//img[@id='captcha_id']/following-sibling::a",
-            "//*[contains(@onclick,'captcha') or contains(@onclick,'refresh')]",
-            "//i[contains(@class,'refresh') or contains(@class,'reload')]",
-            "//span[contains(@class,'refresh')]",
-        ]
-        for xpath in refresh_xpaths:
-            try:
-                el = self.driver.find_element(By.XPATH, xpath)
-                el.click()
-                time.sleep(1.5)
-                refreshed = True
-                logger.debug(f"Refreshed CAPTCHA via: {xpath}")
-                break
-            except Exception:
-                continue
-
-        if not refreshed:
-            # Nuclear option: reload page and re-select Project
-            logger.info("No refresh button found — reloading page")
+        """Reliably get a fresh CAPTCHA image and reset form state."""
+        logger.info("Reloading page to refresh CAPTCHA and clean form state")
+        try:
             self.driver.refresh()
-            time.sleep(2)
+        except TimeoutException:
+            logger.warning("Page refresh timed out. Attempting to navigate back to SEARCH_URL.")
             try:
-                self.wait.until(EC.presence_of_element_located((By.ID, "Regtype")))
-                Select(self.driver.find_element(By.ID, "Regtype")).select_by_value("Project")
-                time.sleep(1)
-            except Exception as e:
-                logger.warning(f"Re-select after refresh failed: {e}")
-            """Click the CAPTCHA refresh icon to get a new image."""
+                self.driver.get(SEARCH_URL)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Error during page refresh: {e}")
             try:
-                # Most RERA portals have a refresh icon next to the captcha
-                refresh = self.driver.find_element(
-                    By.XPATH,
-                    "//*[@id='captcha_id']/following-sibling::*[1] | "
-                    "//img[contains(@src,'refresh')] | "
-                    "//*[contains(@onclick,'refresh') or contains(@onclick,'captcha')]"
-                )
-                refresh.click()
-            except NoSuchElementException:
-                # Fallback: reload the page and re-submit the form
-                logger.info("No refresh button found — reloading page")
-                self.driver.refresh()
-                self.wait.until(EC.presence_of_element_located((By.ID, "Regtype")))
-                Select(self.driver.find_element(By.ID, "Regtype")).select_by_value("Project")
-            time.sleep(1.5)
+                self.driver.get(SEARCH_URL)
+            except Exception:
+                pass
+        time.sleep(2)
+        self._fill_search_form()
 
     # ── Search Form ──────────────────────
+    def _fill_search_form(self):
+        """Set all search form dropdowns. Handles cascading load waits."""
+        self.wait.until(EC.presence_of_element_located((By.ID, "Regtype")))
+        Select(self.driver.find_element(By.ID, "Regtype")).select_by_value("Project")
+        logger.info("Set Regtype = Project")
+        time.sleep(random.uniform(0.7, 1.5))
+
+        self.wait.until(EC.presence_of_element_located((By.NAME, "projectDist")))
+        Select(self.driver.find_element(By.NAME, "projectDist")).select_by_visible_text("North Goa")
+        logger.info("Set District = North Goa")
+        time.sleep(random.uniform(0.7, 1.5))
+
+        self.wait.until(EC.presence_of_element_located((By.NAME, "subDistrictId")))
+        Select(self.driver.find_element(By.NAME, "subDistrictId")).select_by_visible_text("Bardez")
+        logger.info("Set Taluka = Bardez")
+        time.sleep(random.uniform(0.7, 1.5))
+
+        self.wait.until(EC.presence_of_element_located((By.NAME, "villageId")))
+        Select(self.driver.find_element(By.NAME, "villageId")).select_by_visible_text("Assagao")
+        logger.info("Set Village = Assagao")
+        time.sleep(random.uniform(0.7, 1.5))
+
     def submit_search_form(self):
         try:
             self.driver.get(SEARCH_URL)
-            self.wait.until(EC.presence_of_element_located((By.ID, "Regtype")))
-            Select(self.driver.find_element(By.ID, "Regtype")).select_by_value(
-                "Project"
-            )
-            time.sleep(1)
+            self._fill_search_form()
             self.search_with_captcha_retry()
             logger.info("Search form submitted successfully — results loaded")
         except CaptchaFailureError:
@@ -310,7 +292,6 @@ class RERADownloader:
             logger.error("submit_search_form failed", exc_info=True)
             raise
 
-    # ── Pagination ───────────────────────
     def _parse_total_records(self):
         try:
             txt = self.driver.find_element(
@@ -340,7 +321,6 @@ class RERADownloader:
                     return el
             except NoSuchElementException:
                 continue
-        # XPath fallback
         try:
             el = self.driver.find_element(
                 By.XPATH,
@@ -383,7 +363,6 @@ class RERADownloader:
             logger.error("download_all_result_pages failed", exc_info=True)
             raise
 
-    # ── Detail + PDF ─────────────────────
     def download_detail_page(self, url, reg_no):
         try:
             self.driver.get(url)
@@ -446,12 +425,18 @@ class RERAParser:
     def _parse_single_card(self, card):
         record = {}
 
-        # Project name — look for text containing "PROJECT:"
-        for tag in card.find_all(["h2", "h3", "h4", "strong", "b", "span", "div"]):
-            txt = tag.get_text(strip=True)
-            if txt.upper().startswith("PROJECT:"):
-                record["project_name"] = txt.split(":", 1)[1].strip()
-                break
+        # Project name — <h1><span>Project: </span> Aangan</h1>
+        # The name is the text node AFTER the span, not inside it
+        project_span = card.find("span", string=re.compile(r"Project\s*:", re.I))
+        if project_span:
+            for sibling in project_span.next_siblings:
+                if isinstance(sibling, NavigableString) and sibling.strip():
+                    record["project_name"] = sibling.strip()
+                    break
+            if "project_name" not in record:
+                parent_text = project_span.parent.get_text(strip=True)
+                span_text = project_span.get_text(strip=True)
+                record["project_name"] = parent_text.replace(span_text, "").strip()
 
         # Registration number
         for tag in card.find_all(string=re.compile(r"Reg\s*No\.?\s*:", re.I)):
@@ -507,29 +492,24 @@ class RERAParser:
         return record if record.get("reg_no") else record
 
     def _extract_section(self, soup, heading):
-        header = soup.find(
-            ["h1", "h2", "h3", "h4", "h5"],
-            string=lambda t: t and heading.lower() in t.lower(),
-        )
-        if not header:
+        header_el = None
+        
+        # 1. Scan structural tags. .get_text() ignores the nested <span> 
+        # and cleanly joins "Promoter" and "Details" together.
+        for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "div"]):
+            tag_text = tag.get_text(separator=" ", strip=True).lower()
+            
+            # Check if our target heading is in this squished text
+            if heading.lower() in tag_text and len(tag_text) < 80:
+                header_el = tag
+                break
+
+        if not header_el:
             logger.warning(f"Section '{heading}' not found")
             return []
 
-        table = None
-        for sibling in header.next_siblings:
-            if isinstance(sibling, NavigableString):
-                continue
-            if sibling.name == "table":
-                table = sibling
-                break
-            # Stop if we hit another heading
-            if sibling.name in ["h1", "h2", "h3", "h4", "h5"]:
-                break
-            # Check for nested table
-            nested = sibling.find("table")
-            if nested:
-                table = nested
-                break
+        # 2. Once the <h1> is found, grab the very next <table> in the HTML
+        table = header_el.find_next("table")
 
         if not table:
             logger.warning(f"No table found for section '{heading}'")
@@ -563,7 +543,10 @@ class RERAParser:
 
         results = []
         for row in data_rows:
-            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            cells = [
+                td.get_text(strip=True).replace("[at]", "@").replace("[dot]", ".")
+                for td in row.find_all("td")
+            ]
             if len(cells) == len(headers):
                 results.append(dict(zip(headers, cells)))
             elif cells:
@@ -581,7 +564,6 @@ class RERAParser:
 
             sections = [
                 "Promoter Details",
-                "Project Details",
                 "Project Architects",
                 "Structural Engineers",
             ]
@@ -608,14 +590,14 @@ class RERAParser:
 class RERAOrchestrator:
     """Thin coordinator + Excel export."""
 
-    def run(self, mode="full", limit=None):
+    def run(self, mode="full", limit=None, visible=False):
         start = time.time()
-        logger.info(f"Run started — mode={mode}, limit={limit}")
+        logger.info(f"Run started — mode={mode}, limit={limit}, visible={visible}")
         all_projects = []
 
         try:
             if mode in ("download", "full"):
-                self._run_download(limit=limit)
+                self._run_download(limit=limit, visible=visible)
 
             if mode in ("parse", "full"):
                 all_projects = self._run_parse(limit=limit)
@@ -632,8 +614,8 @@ class RERAOrchestrator:
             logger.error("Orchestrator run failed", exc_info=True)
             raise
 
-    def _run_download(self, limit=None):
-        downloader = RERADownloader()
+    def _run_download(self, limit=None, visible=False):
+        downloader = RERADownloader(headless=not visible)
         parser = RERAParser()
         try:
             downloader.submit_search_form()
@@ -693,11 +675,36 @@ class RERAOrchestrator:
         if not projects:
             logger.warning("No projects to export")
             return
-        df = pd.DataFrame(projects)
-        df = df.reindex(sorted(df.columns), axis=1)
+            
+        new_df = pd.DataFrame(projects)
         output_path = "./Goa_RERA_Master.xlsx"
+        
+        if os.path.exists(output_path):
+            try:
+                existing_df = pd.read_excel(output_path, engine="openpyxl")
+                
+                # Filter out new projects that are already present in the existing Excel sheet
+                if 'reg_no' in existing_df.columns and 'reg_no' in new_df.columns:
+                    existing_reg_nos = set(existing_df['reg_no'].dropna())
+                    initial_new_count = len(new_df)
+                    new_df = new_df[~new_df['reg_no'].isin(existing_reg_nos)]
+                    skipped_count = initial_new_count - len(new_df)
+                    if skipped_count > 0:
+                        logger.info(f"Skipped {skipped_count} duplicate projects that already exist in {output_path}")
+
+                # Concat automatically aligns columns. Missing data becomes NaN.
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                df = combined_df
+            except Exception as e:
+                logger.warning(f"Could not read existing Excel file (it might be corrupted/open), creating new: {e}")
+                df = new_df
+        else:
+            df = new_df
+
+        # Sort columns alphabetically for consistency
+        df = df.reindex(sorted(df.columns), axis=1)
         df.to_excel(output_path, index=False, engine="openpyxl")
-        logger.info(f"Exported {len(df)} rows -> {output_path}")
+        logger.info(f"Exported {len(df)} total rows -> {output_path} (Appended {len(new_df)} new rows)")
 
 
 # ══════════════════════════════════════════
@@ -719,5 +726,10 @@ if __name__ == "__main__":
         default=None,
         help="Dev mode: limit to first N projects (e.g. --limit 5)",
     )
+    ap.add_argument(
+        "--visible",
+        action="store_true",
+        help="Show the Chrome browser window in real-time (disable headless mode)",
+    )
     args = ap.parse_args()
-    RERAOrchestrator().run(mode=args.mode, limit=args.limit)
+    RERAOrchestrator().run(mode=args.mode, limit=args.limit, visible=args.visible)

@@ -123,66 +123,6 @@ class RERADownloader:
                 return result2
 
         return result
-        from PIL import ImageFilter
-        
-        captcha_el = self.driver.find_element(By.ID, "captcha_id")
-        png_bytes = captcha_el.screenshot_as_png
-
-        os.makedirs("./captcha_debug", exist_ok=True)
-        ts = int(time.time())
-        
-        img_orig = Image.open(io.BytesIO(png_bytes))
-        
-        if debug:
-            img_orig.save(f"./captcha_debug/raw_{ts}.png")
-
-        # Strategy 1: Standard grayscale + aggressive contrast
-        img = img_orig.convert("L")
-        img = ImageEnhance.Contrast(img).enhance(3.0)
-        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
-        img = img.point(lambda x: 0 if x < 150 else 255)
-        img = img.filter(ImageFilter.SHARPEN)
-        
-        if debug:
-            img.save(f"./captcha_debug/processed_{ts}.png")
-
-        psm_modes = ["--psm 8", "--psm 7", "--psm 13"]
-        whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        
-        for psm in psm_modes:
-            text = pytesseract.image_to_string(
-                img,
-                config=f"{psm} --oem 3 -c tessedit_char_whitelist={whitelist}",
-            )
-            result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
-            logger.info(f"OCR ({psm}): '{result}' ({len(result)} chars)")
-            if len(result) == 6:
-                return result
-
-        # Strategy 2: Try on RGB channels separately (catches colored-text CAPTCHAs)
-        for channel_idx, channel_name in enumerate(["R", "G", "B"]):
-            ch = img_orig.split()[channel_idx]
-            ch = ImageEnhance.Contrast(ch).enhance(3.0)
-            ch = ch.resize((ch.width * 4, ch.height * 4), Image.LANCZOS)
-            ch = ch.point(lambda x: 0 if x < 150 else 255)
-            
-            if debug:
-                ch.save(f"./captcha_debug/channel_{channel_name}_{ts}.png")
-            
-            text = pytesseract.image_to_string(
-                ch,
-                config=f"--psm 8 --oem 3 -c tessedit_char_whitelist={whitelist}",
-            )
-            result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
-            logger.info(f"OCR (channel {channel_name}): '{result}' ({len(result)} chars)")
-            if len(result) == 6:
-                return result
-
-        # Return best guess even if not 6 chars (let retry loop handle it)
-        text = pytesseract.image_to_string(
-            img, config=f"--psm 8 --oem 3 -c tessedit_char_whitelist={whitelist}"
-        )
-        return re.sub(r"[^A-Za-z0-9]", "", text).strip()
 
     def search_with_captcha_retry(self, max_attempts=10):  # bumped to 10
         for attempt in range(1, max_attempts + 1):
@@ -372,17 +312,26 @@ class RERADownloader:
                 f.write(self.driver.page_source)
             logger.info(f"[{reg_no}] Detail page cached")
 
-            soup = BeautifulSoup(self.driver.page_source, "html.parser")
-            deed_link = soup.find("a", string=re.compile(r"Land Deed/Agreement", re.I))
-
-            if deed_link and deed_link.get("href"):
-                deed_url = urljoin(BASE_URL, deed_link["href"])
+            # Find the link in the live DOM. The text often has weird newlines/tabs like:
+            # "Land\n\t\tDeed/Agreement". Using contains() for both 'Land' and 'Deed' handles this safely.
+            try:
+                deed_el = self.driver.find_element(
+                    By.XPATH,
+                    "//a[contains(@href, 'download?DOC_ID=') and contains(., 'Land') and contains(., 'Deed')]"
+                )
+                deed_href = deed_el.get_attribute("href")
                 existing_files = set(os.listdir(DEEDS_DIR))
-                self.driver.get(deed_url)
-                logger.info(f"[{reg_no}] Deed download triggered: {deed_link.text}")
+                
+                # Trigger click via JS to bypass any potential scrolling/overlay interception
+                self.driver.execute_script("arguments[0].click();", deed_el)
+                
+                logger.info(f"[{reg_no}] Deed download triggered (href: {deed_href})")
                 self._wait_for_download(existing_files)
-            else:
+                
+            except NoSuchElementException:
                 logger.warning(f"[{reg_no}] No deed link found on detail page")
+            except Exception as e:
+                logger.warning(f"[{reg_no}] Failed to trigger deed download: {e}")
         except Exception as e:
             logger.error(f"[{reg_no}] detail page failed", exc_info=True)
 
@@ -391,7 +340,7 @@ class RERADownloader:
         while time.time() - start < timeout:
             current = set(os.listdir(DEEDS_DIR))
             new_files = current - existing_files
-            crdownloads = [f for f in current if f.endswith(".crdownload")]
+            crdownloads = [f for f in current if f.endswith(".crdownload") or f.endswith(".tmp")]
             if new_files and not crdownloads:
                 new_pdfs = [f for f in new_files if f.endswith(".pdf")]
                 if new_pdfs:

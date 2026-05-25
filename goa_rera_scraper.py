@@ -73,6 +73,14 @@ class RERADownloader:
         driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(30)
         driver.implicitly_wait(5)
+        
+        # Enable file downloads in headless mode (prefs alone don't work)
+        download_dir = os.path.abspath(DEEDS_DIR)
+        driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+            "behavior": "allow",
+            "downloadPath": download_dir,
+        })
+        
         return driver
 
     # ── CAPTCHA ──────────────────────────
@@ -89,39 +97,85 @@ class RERADownloader:
             ts = int(time.time())
             img_orig.save(f"./captcha_debug/raw_{ts}.png")
 
-        img = img_orig.convert("L")                                    
-        img = ImageEnhance.Contrast(img).enhance(1.8)                  
-        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS) 
-        img = img.point(lambda x: 0 if x < 180 else 255)              
+        whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
-        if debug:
-            img.save(f"./captcha_debug/processed_{ts}.png")
+        # ── Strategy 1: Grayscale with multiple thresholds & PSM modes ──
+        for threshold in [160, 180, 140, 200]:
+            for contrast in [1.8, 2.5, 1.2]:
+                img = img_orig.convert("L")
+                img = ImageEnhance.Contrast(img).enhance(contrast)
+                img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
+                img = img.point(lambda x, t=threshold: 0 if x < t else 255)
 
-        whitelist = (
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        )
+                for psm in ["--psm 7", "--psm 8", "--psm 13"]:
+                    text = pytesseract.image_to_string(
+                        img,
+                        config=f"{psm} --oem 3 -c tessedit_char_whitelist={whitelist}",
+                    )
+                    result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+                    if len(result) == 6:
+                        if debug:
+                            img.save(f"./captcha_debug/processed_{ts}.png")
+                        logger.info(f"OCR result: '{result}' (6 chars) [threshold={threshold}, contrast={contrast}, {psm}]")
+                        return result
 
-        # PRIMARY: PSM 7 — single text line mode (most accurate for this font)
+        # ── Strategy 2: Individual RGB channels ──
+        for channel_idx, channel_name in enumerate(["R", "G", "B"]):
+            ch = img_orig.split()[channel_idx]
+            ch = ImageEnhance.Contrast(ch).enhance(3.0)
+            ch = ch.resize((ch.width * 4, ch.height * 4), Image.LANCZOS)
+            ch = ch.point(lambda x: 0 if x < 150 else 255)
+
+            text = pytesseract.image_to_string(
+                ch,
+                config=f"--psm 7 --oem 3 -c tessedit_char_whitelist={whitelist}",
+            )
+            result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+            if len(result) == 6:
+                logger.info(f"OCR result: '{result}' (6 chars) [channel={channel_name}]")
+                return result
+
+        # ── Strategy 3: Inverted image ──
+        img_inv = ImageOps.invert(img_orig.convert("L"))
+        img_inv = ImageEnhance.Contrast(img_inv).enhance(2.0)
+        img_inv = img_inv.resize((img_inv.width * 4, img_inv.height * 4), Image.LANCZOS)
+        img_inv = img_inv.point(lambda x: 0 if x < 128 else 255)
         text = pytesseract.image_to_string(
-            img,
-            config=f"--psm 7 --oem 1 -c tessedit_char_whitelist={whitelist}",
+            img_inv,
+            config=f"--psm 7 --oem 3 -c tessedit_char_whitelist={whitelist}",
         )
         result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
-        logger.info(f"OCR result: '{result}' ({len(result)} chars)")
+        if len(result) == 6:
+            logger.info(f"OCR result: '{result}' (6 chars) [inverted]")
+            return result
 
-        # FALLBACK: if PSM 7 gives wrong length, try gentle-contrast variant
-        if len(result) != 6:
-            img2 = img_orig.convert("L")
-            img2 = img2.resize((img2.width * 4, img2.height * 4), Image.LANCZOS)
-            text2 = pytesseract.image_to_string(
-                img2,
-                config=f"--psm 7 --oem 1 -c tessedit_char_whitelist={whitelist}",
-            )
-            result2 = re.sub(r"[^A-Za-z0-9]", "", text2).strip()
-            logger.info(f"OCR fallback: '{result2}' ({len(result2)} chars)")
-            if len(result2) == 6:
-                return result2
+        # ── Strategy 4: Median filter to remove noise, then OCR ──
+        img_med = img_orig.convert("L").filter(ImageFilter.MedianFilter(3))
+        img_med = ImageEnhance.Contrast(img_med).enhance(2.0)
+        img_med = img_med.resize((img_med.width * 4, img_med.height * 4), Image.LANCZOS)
+        img_med = img_med.point(lambda x: 0 if x < 160 else 255)
+        text = pytesseract.image_to_string(
+            img_med,
+            config=f"--psm 7 --oem 3 -c tessedit_char_whitelist={whitelist}",
+        )
+        result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+        if len(result) == 6:
+            logger.info(f"OCR result: '{result}' (6 chars) [median-filtered]")
+            return result
 
+        # ── None of the strategies produced 6 chars — return best guess ──
+        # Re-run the most reliable combo as a last resort
+        img = img_orig.convert("L")
+        img = ImageEnhance.Contrast(img).enhance(1.8)
+        img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
+        img = img.point(lambda x: 0 if x < 180 else 255)
+        if debug:
+            img.save(f"./captcha_debug/processed_{ts}.png")
+        text = pytesseract.image_to_string(
+            img, config=f"--psm 7 --oem 3 -c tessedit_char_whitelist={whitelist}"
+        )
+        result = re.sub(r"[^A-Za-z0-9]", "", text).strip()
+        logger.warning(f"OCR best-guess: '{result}' ({len(result)} chars) — no 6-char match found")
         return result
 
     def search_with_captcha_retry(self, max_attempts=10):  # bumped to 10
@@ -216,8 +270,8 @@ class RERADownloader:
         time.sleep(random.uniform(0.7, 1.5))
 
         self.wait.until(EC.presence_of_element_located((By.NAME, "villageId")))
-        Select(self.driver.find_element(By.NAME, "villageId")).select_by_visible_text("Assagao")
-        logger.info("Set Village = Assagao")
+        Select(self.driver.find_element(By.NAME, "villageId")).select_by_visible_text("Reis Magos (ct)")
+        logger.info("Set Village = Reis Magos (ct)")
         time.sleep(random.uniform(0.7, 1.5))
 
     def submit_search_form(self):
@@ -249,28 +303,36 @@ class RERADownloader:
             self.driver.find_elements(By.CSS_SELECTOR, "div.search_result_list")
         )
 
-    def _find_next_button(self):
-        selectors = [
-            (By.CSS_SELECTOR, 'a[aria-label="Next"]'),
-            (By.CSS_SELECTOR, 'a.page-link[rel="next"]'),
-        ]
-        for by, sel in selectors:
-            try:
-                el = self.driver.find_element(by, sel)
-                if el.is_displayed() and el.is_enabled():
-                    return el
-            except NoSuchElementException:
-                continue
+    def _find_next_page_offset(self):
+        """Find the 'pagging(N)' offset for the next page, or None if on last page.
+        
+        The Goa RERA portal uses <ul class="pagination"> with <li> items.
+        The current page has class="active". We need the first non-active,
+        non-disabled <li> link that comes AFTER the active one.
+        Its href is like 'javascript:pagging(10)'.
+        """
         try:
-            el = self.driver.find_element(
-                By.XPATH,
-                '//a[contains(text(),"Next") and not(@disabled)]',
-            )
-            if el.is_displayed() and el.is_enabled():
-                return el
+            pagination = self.driver.find_element(By.CSS_SELECTOR, "ul.pagination")
+            items = pagination.find_elements(By.TAG_NAME, "li")
+            
+            found_active = False
+            for item in items:
+                classes = item.get_attribute("class") or ""
+                if "active" in classes:
+                    found_active = True
+                    continue
+                if found_active and "disabled" not in classes:
+                    link = item.find_element(By.TAG_NAME, "a")
+                    href = link.get_attribute("href") or ""
+                    m = re.search(r"pagging\((\d+)\)", href)
+                    if m:
+                        return int(m.group(1))
+            return None
         except NoSuchElementException:
-            pass
-        return None
+            return None
+        except Exception as e:
+            logger.debug(f"Pagination lookup error: {e}")
+            return None
 
     def download_all_result_pages(self):
         try:
@@ -286,11 +348,12 @@ class RERADownloader:
                     f.write(self.driver.page_source)
                 logger.info(f"Saved page {page_num} ({cards} cards)")
 
-                next_btn = self._find_next_button()
-                if next_btn:
-                    next_btn.click()
+                next_offset = self._find_next_page_offset()
+                if next_offset is not None:
+                    logger.info(f"Navigating to next page (startFrom={next_offset})")
+                    self.driver.execute_script(f"pagging({next_offset})")
                     time.sleep(3)
-                    WebDriverWait(self.driver, 10).until(
+                    WebDriverWait(self.driver, 15).until(
                         EC.presence_of_element_located(
                             (By.CSS_SELECTOR, "div.search_result_list")
                         )
@@ -314,24 +377,28 @@ class RERADownloader:
 
             # Find the link in the live DOM. The text often has weird newlines/tabs like:
             # "Land\n\t\tDeed/Agreement". Using contains() for both 'Land' and 'Deed' handles this safely.
-            try:
-                deed_el = self.driver.find_element(
-                    By.XPATH,
-                    "//a[contains(@href, 'download?DOC_ID=') and contains(., 'Land') and contains(., 'Deed')]"
-                )
-                deed_href = deed_el.get_attribute("href")
-                existing_files = set(os.listdir(DEEDS_DIR))
-                
-                # Trigger click via JS to bypass any potential scrolling/overlay interception
-                self.driver.execute_script("arguments[0].click();", deed_el)
-                
-                logger.info(f"[{reg_no}] Deed download triggered (href: {deed_href})")
-                self._wait_for_download(existing_files)
-                
-            except NoSuchElementException:
-                logger.warning(f"[{reg_no}] No deed link found on detail page")
-            except Exception as e:
-                logger.warning(f"[{reg_no}] Failed to trigger deed download: {e}")
+            
+            # --- COMMENTED OUT: Temporarily disabling deed downloads ---
+            # try:
+            #     deed_el = self.driver.find_element(
+            #         By.XPATH,
+            #         "//a[contains(@href, 'download?DOC_ID=') and contains(., 'Land') and contains(., 'Deed')]"
+            #     )
+            #     deed_href = deed_el.get_attribute("href")
+            #     existing_files = set(os.listdir(DEEDS_DIR))
+            #     
+            #     # Trigger click via JS to bypass any potential scrolling/overlay interception
+            #     self.driver.execute_script("arguments[0].click();", deed_el)
+            #     
+            #     logger.info(f"[{reg_no}] Deed download triggered (href: {deed_href})")
+            #     self._wait_for_download(existing_files)
+            #     
+            # except NoSuchElementException:
+            #     logger.warning(f"[{reg_no}] No deed link found on detail page")
+            # except Exception as e:
+            #     logger.warning(f"[{reg_no}] Failed to trigger deed download: {e}")
+            # -----------------------------------------------------------
+            
         except Exception as e:
             logger.error(f"[{reg_no}] detail page failed", exc_info=True)
 
@@ -401,8 +468,6 @@ class RERAParser:
         if table:
             cells = [td.get_text(strip=True) for td in table.find_all("td")]
             headers_map = [
-                "promoter",
-                "promoter_type",
                 "total_area",
                 "property_type",
                 "status",
@@ -513,6 +578,7 @@ class RERAParser:
 
             sections = [
                 "Promoter Details",
+                "Authorized Person Details",
                 "Project Architects",
                 "Structural Engineers",
             ]
@@ -520,10 +586,13 @@ class RERAParser:
             for section_name in sections:
                 rows = self._extract_section(soup, section_name)
                 prefix = re.sub(r"\s+", "_", section_name.lower())
-                for idx, row_dict in enumerate(rows):
+                for row_dict in rows:
                     for key, val in row_dict.items():
-                        flat_key = f"{prefix}_{idx}_{key}"
-                        merged[flat_key] = val
+                        flat_key = f"{prefix}_{key}"
+                        if flat_key in merged:
+                            merged[flat_key] += f", {val}"
+                        else:
+                            merged[flat_key] = val
 
             return merged
         except Exception as e:

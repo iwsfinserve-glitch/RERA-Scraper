@@ -270,8 +270,8 @@ class RERADownloader:
         time.sleep(random.uniform(0.7, 1.5))
 
         self.wait.until(EC.presence_of_element_located((By.NAME, "villageId")))
-        Select(self.driver.find_element(By.NAME, "villageId")).select_by_visible_text("Reis Magos (ct)")
-        logger.info("Set Village = Reis Magos (ct)")
+        Select(self.driver.find_element(By.NAME, "villageId")).select_by_visible_text("Siolim (ct)")
+        logger.info("Set Village = Siolim (ct)")
         time.sleep(random.uniform(0.7, 1.5))
 
     def submit_search_form(self):
@@ -636,10 +636,35 @@ class RERAOrchestrator:
         downloader = RERADownloader(headless=not visible)
         parser = RERAParser()
         try:
+            # Build set of already-scraped reg_nos to skip re-downloading
+            already_scraped = set()
+            
+            # Check cached detail HTML files
+            for cached_file in glob(os.path.join(CACHE_DIR, "detail_*.html")):
+                basename = os.path.basename(cached_file)
+                # Extract reg_no from filename like "detail_PRGO03262596.html"
+                rno = basename.replace("detail_", "").replace(".html", "")
+                if rno:
+                    already_scraped.add(rno)
+            
+            # Check existing Excel sheet
+            output_path = "./Goa_RERA_Master.xlsx"
+            if os.path.exists(output_path):
+                try:
+                    existing_df = pd.read_excel(output_path, engine="openpyxl")
+                    if "reg_no" in existing_df.columns:
+                        already_scraped.update(existing_df["reg_no"].dropna().astype(str).tolist())
+                except Exception as e:
+                    logger.warning(f"Could not read Excel for skip-check: {e}")
+            
+            if already_scraped:
+                logger.info(f"Found {len(already_scraped)} already-scraped projects — will skip them")
+            
             downloader.submit_search_form()
             downloader.download_all_result_pages()
 
             detail_count = 0
+            skipped_count = 0
             for page_file in sorted(glob(os.path.join(CACHE_DIR, "results_page_*.html"))):
                 with open(page_file, "r", encoding="utf-8") as f:
                     html = f.read()
@@ -651,10 +676,16 @@ class RERAOrchestrator:
                     url = card.get("detail_url")
                     rno = card.get("reg_no")
                     if url and rno:
+                        if rno in already_scraped:
+                            skipped_count += 1
+                            continue
                         downloader.download_detail_page(url, rno)
                         detail_count += 1
                 if limit and detail_count >= limit:
                     break
+            
+            if skipped_count:
+                logger.info(f"Skipped {skipped_count} already-scraped projects")
         finally:
             downloader.driver.quit()
             logger.info("Browser closed")
